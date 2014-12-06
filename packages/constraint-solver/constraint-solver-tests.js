@@ -23,19 +23,12 @@ var makeResolver = function (data) {
   });
 
   var catalogStub = {
-    getSortedVersions: function (name) {
-      return _.pluck(
-        Versions.find({
-          packageName: name
-        }, { fields: { version: 1 } }).fetch(),
-        'version'
-      ).sort(PackageVersion.compare);
-    },
-    getVersion: function (name, version) {
-      return Versions.findOne({
-        packageName: name,
-        version: version
+    getSortedVersionRecords: function (name) {
+      var records = Versions.find({packageName: name}).fetch();
+      records.sort(function (a, b) {
+        return PackageVersion.compare(a.version, b.version);
       });
+      return records;
     }
   };
   return new ConstraintSolver.PackagesResolver(catalogStub);
@@ -87,7 +80,7 @@ var testWithResolver = function (test, resolver, f) {
     var constraints = splitArgs(deps).constraints;
 
     var resolvedDeps = resolver.resolve(dependencies, constraints, options);
-    test.equal(resolvedDeps, { answer: expected });
+    test.equal(resolvedDeps.answer, expected);
   };
 
   var FAIL = function (deps, regexp) {
@@ -156,7 +149,7 @@ Tinytest.add("constraint solver - no results", function (test) {
         && error.message.match(/bad-2@1\.0\.0/)
         // We shouldn't get shown indirect itself in a pathway: that would just
         // be an artifact of there being a path that passes through another
-        // unibuild.  (Note: we might change our mind and decide that all these
+        // package.  (Note: we might change our mind and decide that all these
         // lines should end in the relevant constraint, which would probably be
         // nice! But in that case, we should test that no line ends with TWO
         // mentions of indirect.)

@@ -13,6 +13,7 @@ var isopack = require('./isopack.js');
 var utils = require('./utils.js');
 var buildmessage = require('./buildmessage.js');
 var Console = require('./console.js').Console;
+var auth = require('./auth.js');
 
 /**
  * Check to see if an update is available. If so, download and install
@@ -36,6 +37,10 @@ exports.tryToDownloadUpdate = function (options) {
 var firstCheck = true;
 
 var checkForUpdate = function (showBanner) {
+  // While we're doing background stuff, try to revoke any old tokens in our
+  // session file.
+  auth.tryRevokeOldTokens({timeout: 15*1000});
+
   if (firstCheck) {
     // We want to avoid a potential race condition here, because we run an
     // update almost immediately at run.  We don't want to drop the resolver
@@ -45,9 +50,8 @@ var checkForUpdate = function (showBanner) {
     // the first update cycle.
     firstCheck = false;
   } else {
-    // Silent is currently unused, but we keep it as a hint here...
     try {
-      catalog.complete.refreshOfficialCatalog({silent: true});
+      catalog.official.refresh();
     } catch (err) {
       Console.debug("Failed to refresh catalog, ignoring error", err);
       return;
@@ -88,37 +92,14 @@ var maybeShowBanners = function () {
 
   var banner = releaseData.banner;
   if (banner) {
-    var bannersShown = {};
-    try {
-      bannersShown = JSON.parse(
-        fs.readFileSync(config.getBannersShownFilename()));
-    } catch (e) {
-      // ... ignore
-    }
-
-    var shouldShowBanner = false;
-    if (_.has(bannersShown, release.current.name)) {
-      // XXX use EJSON so that we can just have Dates
-      var lastShown = new Date(bannersShown[release.current.name]);
-      var bannerUpdated = banner.lastUpdated ?
-            new Date(banner.lastUpdated) : new Date;
-      // XXX should the default really be "once ever" and not eg "once a week"?
-      if (lastShown < bannerUpdated) {
-        shouldShowBanner = true;
-      }
-    } else {
-      shouldShowBanner = true;
-    }
-
-    if (shouldShowBanner) {
+    var bannerDate =
+          banner.lastUpdated ? new Date(banner.lastUpdated) : new Date;
+    if (catalog.official.shouldShowBanner(release.current.name, bannerDate)) {
       // This banner is new; print it!
       runLog.log("");
       runLog.log(banner.text);
       runLog.log("");
-      bannersShown[release.current.name] = new Date;
-      // XXX ick slightly racy
-      fs.writeFileSync(config.getBannersShownFilename(),
-                       JSON.stringify(bannersShown, null, 2));
+      catalog.official.setBannerShownDate(release.current.name, bannerDate);
       return;
     }
   }

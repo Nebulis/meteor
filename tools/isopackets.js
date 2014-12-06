@@ -3,12 +3,13 @@ var path = require('path');
 var bundler = require('./bundler.js');
 var Builder = require('./builder.js');
 var buildmessage = require('./buildmessage.js');
-var packageLoader = require("./package-loader.js");
 var files = require('./files.js');
 var compiler = require('./compiler.js');
 var config = require('./config.js');
 var watch = require('./watch.js');
 var Console = require('./console.js').Console;
+var isopackCacheModule = require('./isopack-cache.js');
+var packageMapModule = require('./package-map.js');
 
 // An isopacket is a predefined set of isopackages which the meteor command-line
 // tool can load into its process. This is how we use the DDP client and many
@@ -18,7 +19,7 @@ var Console = require('./console.js').Console;
 // All packages that are in isopackets and all of their transitive dependencies
 // must be part of the core Meteor git checkout (not loaded from troposphere).
 //
-// The requested packages will be loaded together will all of their
+// The requested packages will be loaded together with all of their
 // dependencies. If you request to load the same isopacket more than once, you
 // will efficiently get the same pre-loaded isopacket. On the other hand, two
 // different loaded isopackets contain distinct copies of all of their packages
@@ -116,67 +117,72 @@ var ensureIsopacketsLoadable = function () {
     return;
   }
 
-  // We make these two objects lazily later.
-  var isopacketCatalog = null;
-  var localPackageLoader = null;
+  // We make this object lazily later.
+  var isopacketBuildContext = null;
 
+  var failedPackageBuild = false;
   // Look at each isopacket. Check to see if it's on disk and up to date. If
   // not, build it. We rebuild them in the order listed in ISOPACKETS, which
   // ensures that we deal with js-analyze first.
-  var messages = buildmessage.capture(function () {
-    _.each(ISOPACKETS, function (packages, isopacketName) {
-      var isopacketRoot = isopacketPath(isopacketName);
-      var existingBuildinfo = files.readJSONOrNull(
-        path.join(isopacketRoot, 'isopacket-buildinfo.json'));
-      var needRebuild = ! existingBuildinfo;
-      if (! needRebuild && existingBuildinfo.builtBy !== compiler.BUILT_BY) {
-        needRebuild = true;
-      }
-      if (! needRebuild) {
-        var watchSet = watch.WatchSet.fromJSON(existingBuildinfo.watchSet);
-        if (! watch.isUpToDate(watchSet)) {
+  var messages = Console.withProgressDisplayVisible(function () {
+    return buildmessage.capture(function () {
+      _.each(ISOPACKETS, function (packages, isopacketName) {
+        if (failedPackageBuild)
+          return;
+
+        var isopacketRoot = isopacketPath(isopacketName);
+        var existingBuildinfo = files.readJSONOrNull(
+          path.join(isopacketRoot, 'isopacket-buildinfo.json'));
+        var needRebuild = ! existingBuildinfo;
+        if (! needRebuild && existingBuildinfo.builtBy !== compiler.BUILT_BY) {
           needRebuild = true;
         }
-      }
-      if (! needRebuild) {
-        // Great, it's loadable without a rebuild.
-        loadedIsopackets[isopacketName] = null;
-        return;
-      }
-
-      // We're going to need to build! Make a catalog and loader if we haven't
-      // yet.
-      if (! isopacketCatalog) {
-        isopacketCatalog = newIsopacketBuildingCatalog();
-        localPackageLoader = new packageLoader.PackageLoader({
-          versions: null,
-          catalog: isopacketCatalog,
-          constraintSolverOpts: { ignoreProjectDeps: true }
-        });
-      }
-
-      buildmessage.enterJob({
-        title: "Compiling " + isopacketName + " packages for the tool"
-      }, function () {
-        var built = bundler.buildJsImage({
-          name: "isopacket-" + isopacketName,
-          packageLoader: localPackageLoader,
-          use: packages,
-          catalog: isopacketCatalog,
-          ignoreProjectDeps: true
-        });
-
-        if (buildmessage.jobHasMessages())
+        if (! needRebuild) {
+          var watchSet = watch.WatchSet.fromJSON(existingBuildinfo.watchSet);
+          if (! watch.isUpToDate(watchSet)) {
+            needRebuild = true;
+          }
+        }
+        if (! needRebuild) {
+          // Great, it's loadable without a rebuild.
+          loadedIsopackets[isopacketName] = null;
           return;
-        var builder = new Builder({outputPath: isopacketRoot});
-        builder.writeJson('isopacket-buildinfo.json', {
-          builtBy: compiler.BUILT_BY,
-          watchSet: built.watchSet.toJSON()
+        }
+
+        // We're going to need to build! Make a catalog and loader if we haven't
+        // yet.
+        if (! isopacketBuildContext) {
+          isopacketBuildContext = makeIsopacketBuildContext();
+        }
+
+        buildmessage.enterJob({
+          title: "Bundling " + isopacketName + " packages for the tool"
+        }, function () {
+          // Build the packages into the in-memory IsopackCache.
+          isopacketBuildContext.isopackCache.buildLocalPackages(packages);
+          if (buildmessage.jobHasMessages())
+            return;
+
+          // Now bundle them into a program.
+          var built = bundler.buildJsImage({
+            name: "isopacket-" + isopacketName,
+            packageMap: isopacketBuildContext.packageMap,
+            isopackCache: isopacketBuildContext.isopackCache,
+            use: packages
+          });
+          if (buildmessage.jobHasMessages())
+            return;
+
+          var builder = new Builder({outputPath: isopacketRoot});
+          builder.writeJson('isopacket-buildinfo.json', {
+            builtBy: compiler.BUILT_BY,
+            watchSet: built.watchSet.toJSON()
+          });
+          built.image.write(builder);
+          builder.complete();
+          // It's loadable now.
+          loadedIsopackets[isopacketName] = null;
         });
-        built.image.write(builder);
-        builder.complete();
-        // It's loadable now.
-        loadedIsopackets[isopacketName] = null;
       });
     });
   });
@@ -195,11 +201,8 @@ var newIsopacketBuildingCatalog = function () {
   if (! files.inCheckout())
     throw Error("No need to build isopackets unless in checkout!");
 
-  // XXX once a lot more refactors are done, this should be able to just be a
-  // LocalCatalog. There's no reason that resolveConstraints should be called
-  // here!
-  var catalogBootstrapCheckout = require('./catalog-bootstrap-checkout.js');
-  var isopacketCatalog = new catalogBootstrapCheckout.BootstrapCatalogCheckout;
+  var catalogLocal = require('./catalog-local.js');
+  var isopacketCatalog = new catalogLocal.LocalCatalog;
   var messages = buildmessage.capture(
     { title: "Scanning local core packages" },
     function () {
@@ -210,7 +213,8 @@ var newIsopacketBuildingCatalog = function () {
       // (there's no worries about needing to springboard).
       isopacketCatalog.initialize({
         localPackageSearchDirs: [path.join(
-          files.getCurrentToolsDir(), 'packages')]
+          files.getCurrentToolsDir(), 'packages')],
+        buildingIsopackets: true
       });
     });
   if (messages.hasMessages()) {
@@ -219,6 +223,28 @@ var newIsopacketBuildingCatalog = function () {
     throw new Error("isopacket scan failed?");
   }
   return isopacketCatalog;
+};
+
+var makeIsopacketBuildContext = function () {
+  var context = {};
+  var catalog = newIsopacketBuildingCatalog();
+  var versions = {};
+  _.each(catalog.getAllPackageNames(), function (packageName) {
+    versions[packageName] = catalog.getLatestVersion(packageName).version;
+  });
+  context.packageMap = new packageMapModule.PackageMap(versions, catalog);
+  // Make an isopack cache that doesn't save isopacks to disk and has no
+  // access to versioned packages.
+  context.isopackCache = new isopackCacheModule.IsopackCache({
+    packageMap: context.packageMap,
+    // When linking JS files, don't include the padding spaces and line number
+    // comments. Since isopackets are loaded as part of possibly very short
+    // 'meteor' tool command invocations, we care more about startup time than
+    // legibility, and the difference is actually observable (eg 25% speedup
+    // loading constraint-solver).
+    noLineNumbers: true
+  });
+  return context;
 };
 
 // Loads a built isopacket from disk. Always loads (the cache is in 'load', not
@@ -265,5 +291,5 @@ _.extend(exports, {
   load: load,
   ensureIsopacketsLoadable: ensureIsopacketsLoadable,
   ISOPACKETS: ISOPACKETS,
-  newIsopacketBuildingCatalog: newIsopacketBuildingCatalog
+  makeIsopacketBuildContext: makeIsopacketBuildContext
 });
